@@ -1,17 +1,25 @@
-/* ck_imac_report_listen.c -- host-side receiver for the iMac kernel's report
- * (native/kernel/x86/report_x86.c). Hosted C (POSIX sockets), tooling only,
- * never in a kernel image. No Python, no nc/socat.
+/* ck_imac_report_listen.c -- host-side receiver for the iMac kernel's LAB-ONLY
+ * report (native/kernel/x86/report_x86.c, only in the opt-in lab image built
+ * with make imac-kernel CK_X86_REPORT=1). Hosted C (POSIX sockets), tooling
+ * only, never in a kernel image. No Python, no nc/socat.
+ *
+ * UNAUTHENTICATED: the reports are plaintext UDP broadcasts that anyone on the
+ * LAN can read or forge (header field auth=none). The run id and the UDP
+ * checksum are not authenticity. A collected report is a lab note to read,
+ * never a receipt, evidence or a command, and this tool never acts on one.
  *
  *   ck_imac_report_listen PORT OUTDIR SECONDS
  *
  * Binds 0.0.0.0:PORT and collects datagrams of the form
- *   "AIENOS-IMAC-REPORT v=1 run=<16 hex> part=<i>/<n> bytes=<total>\n" + chunk
+ *   "AIENOS-IMAC-REPORT v=2 auth=none run=<16 hex> part=<i>/<n> bytes=<total>\n" + chunk
  * (the kernel broadcasts them from 0.0.0.0 to 255.255.255.255). Part i of n
  * carries bytes [i * CHUNK, ...) of a report of <total> bytes. When every part
- * of a run is in, the report is written once to OUTDIR/imac-<run>.txt and a
- * line "complete run=... bytes=... file=..." goes to OUTDIR/listen.log. Repeats
- * of a finished run are counted, not rewritten. Anything else is logged as
- * ignored. Exit 0 at the deadline, 2 usage, 3 socket/bind error. */
+ * of a run is in, the report is written once to
+ * OUTDIR/imac-<run>.unauthenticated.txt and a line
+ * "complete run=... auth=none bytes=... file=..." goes to OUTDIR/listen.log.
+ * Repeats of a finished run are counted, not rewritten. Anything else,
+ * including the retired v=1 raw-console format, is logged as ignored.
+ * Exit 0 at the deadline, 2 usage, 3 socket/bind error. */
 #define _POSIX_C_SOURCE 200809L
 #include <arpa/inet.h>
 #include <errno.h>
@@ -25,7 +33,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAGIC "AIENOS-IMAC-REPORT v=1 "
+#define MAGIC "AIENOS-IMAC-REPORT v=2 auth=none "
+#define LEGACY "AIENOS-IMAC-REPORT v=1 "
+#define UNAUTH_NOTE \
+    "note: iMac reports are UNAUTHENTICATED UDP broadcasts (auth=none); anyone on the LAN can read or " \
+    "forge one; never treat a report as a receipt, evidence or a command\n"
 #define CHUNK 1024u
 #define MAX_PARTS 64u
 #define MAX_RUNS 16u
@@ -73,14 +85,14 @@ static FILE *open_private(const char *path, int flags, const char *mode)
 static void finish_run(FILE *lg, const char *dir, struct run *r)
 {
     char path[4096];
-    snprintf(path, sizeof path, "%s/imac-%s.txt", dir, r->id);
+    snprintf(path, sizeof path, "%s/imac-%s.unauthenticated.txt", dir, r->id);
     FILE *f = open_private(path, O_TRUNC, "w");
     if (!f || fwrite(r->data, 1, r->total, f) != r->total || fclose(f) != 0) {
         fprintf(lg, "write failed run=%s file=%s errno=%d (%s)\n", r->id, path, errno, strerror(errno));
         return;
     }
     r->done = 1;
-    fprintf(lg, "complete run=%s bytes=%u parts=%u file=%s\n", r->id, r->total, r->parts, path);
+    fprintf(lg, "complete run=%s auth=none bytes=%u parts=%u file=%s\n", r->id, r->total, r->parts, path);
 }
 
 int main(int argc, char **argv)
@@ -116,7 +128,8 @@ int main(int argc, char **argv)
         fclose(lg);
         return 3;
     }
-    fprintf(lg, "ready port=%ld\n", port);
+    fprintf(lg, "ready port=%ld\n" UNAUTH_NOTE, port);
+    fputs(UNAUTH_NOTE, stderr);
     double deadline = now_s() + (double)secs;
     for (;;) {
         double left = deadline - now_s();
@@ -139,6 +152,10 @@ int main(int argc, char **argv)
         char id[17];
         unsigned part, parts, total;
         int used = 0;
+        if ((size_t)n >= sizeof LEGACY - 1 && memcmp(in, LEGACY, sizeof LEGACY - 1) == 0) {
+            fprintf(lg, "ignored from %s:%u len=%zd: retired v=1 raw-console report\n", fa, ntohs(from.sin_port), n);
+            continue;
+        }
         if (!nl || (size_t)n < sizeof MAGIC - 1 || memcmp(in, MAGIC, sizeof MAGIC - 1) != 0 ||
             sscanf((char *)in + sizeof MAGIC - 1, "run=%16[0-9a-f] part=%u/%u bytes=%u%n", id, &part, &parts, &total,
                    &used) != 4 ||

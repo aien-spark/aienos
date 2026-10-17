@@ -7,7 +7,7 @@
  * INIT, SIPI, SIPI with the page number as the vector. A core then starts
  * here in real mode at CS = page >> 4, IP = 0, and walks: 16-bit -> 32-bit
  * protected mode (the trampoline's own flat GDT) -> PAE + the kernel's page
- * tables + EFER.LME + paging -> 64-bit, then calls entry(arg) on its own
+ * tables + EFER.LME/NXE + paging and CR0.WP -> 64-bit, then calls entry(arg) on its own
  * stack (-mabi=ms: the argument in rcx, 32 bytes of shadow space). If entry
  * returns, the core halts with interrupts off. */
 
@@ -44,10 +44,10 @@ tramp_pm32:
     mov %eax, %cr3
     mov $0xc0000080, %ecx              /* EFER */
     rdmsr
-    or $0x100, %eax                    /* LME */
+    or $0x900, %eax                    /* LME + NXE: the kernel's tables carry NX bits */
     wrmsr
     mov %cr0, %eax
-    or $0x80000000, %eax               /* PG */
+    or $0x80010000, %eax               /* PG + WP: read-only pages bind this core too */
     mov %eax, %cr0
     ljmpl *(ck_x86_tramp_far64 - ck_x86_tramp_start)(%ebx)
 

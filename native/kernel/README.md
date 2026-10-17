@@ -14,7 +14,7 @@ QEMU qualifies nothing physical: a PASS here says nothing about real hardware.
 | `core/` | Console, printf, ACPI, reports/panic/PSCI reset, M3 (threads, scheduler, EL0, capabilities, IPC), `kmain.c`. |
 | `tests/` | Host unit tests. |
 | `third_party/omega/` | The canonical Omega Cortex store, byte for byte from the omega commit in `omega.lock` (checked by `scripts/omega_lock_check.sh`); built freestanding by `svc/cortex_store.c` over the sealed Store through `svc/cortex_journal.c` (native v1 plan P06). |
-| `x86/` | x86_64 port, first cut (AIENOS-IMAC-KERNEL-0, 2017 iMac): UEFI stub, descriptor tables and interrupt stubs, page tables, local APIC timer, ACPI power off, console, secondary-core start, PCI walk, read-only AHCI and NVMe disks, transmit-only BCM57766 Ethernet report. |
+| `x86/` | x86_64 port, first cut (AIENOS-IMAC-KERNEL-0, 2017 iMac): UEFI stub, descriptor tables and interrupt stubs, page tables, local APIC timer, ACPI power off, console, secondary-core start, PCI walk, read-only AHCI and NVMe disks, BCM57766 Ethernet link detection; a lab-only, opt-in network report (`CK_X86_REPORT=1`). |
 | `../boot/` | Minimal UEFI entry stub (one image with the kernel). |
 
 ## Build and test
@@ -168,19 +168,39 @@ build refuses any other ATA command); NVMe through the shared
 `x86/`). Both disk_dev write hooks always refuse, serial numbers and MAC
 addresses are never printed, and each disk's GPT is checked by the shared
 `dev/disk_part.c` (both copies, CRCs, the AIENOS partition located if present).
-The Broadcom BCM57766 Ethernet chip (14e4:1686) gets a transmit-only, polled
-driver (`x86/tg3_x86.c`: core reset, bootcode handshake, rings in one DMA block
-below 4 GiB, PHY autonegotiation; it never receives and the MAC address is
-never printed). The last line before the hold is a one-line `summary:`. It
-prints `kernel: alive`, holds the screen 60 s and powers off through ACPI S5.
-During the hold `x86/report_x86.c` sends the RAM copy of the console (first
-16 KiB) every 2 s while the link is up, as UDP broadcast from 0.0.0.0 to
-255.255.255.255 port 47031 (TTL 1), in 1 KiB parts that each start with
-`AIENOS-IMAC-REPORT v=1 run=<id> part=<i>/<n> bytes=<total>`.
-`tools/ck_imac_report_listen.c` (`make -C native/kernel imac-report-listen`,
-run as `ck_imac_report_listen 47031 OUTDIR SECONDS`) rebuilds each run into
-`OUTDIR/imac-<run>.txt`; `scripts/ck_imac_report_test.sh` checks frames and
-reassembly on the host, so a wired iMac no longer needs a photo of its screen. Output: the GOP framebuffer
+The Broadcom BCM57766 Ethernet chip (14e4:1686) gets a polled driver
+(`x86/tg3_x86.c`: core reset, bootcode handshake, rings in one DMA block below
+4 GiB, PHY autonegotiation; it never reads received frames and the MAC address
+is never printed). In the default image it only detects the link: frame
+transmit is not compiled in. The last line before the hold is a one-line
+`summary:`. It prints `kernel: alive`, holds the screen 60 s and powers off
+through ACPI S5.
+
+**Network report: lab-only, opt-in, unauthenticated.** `make -C native/kernel
+imac-kernel CK_X86_REPORT=1` builds a separate lab image,
+`IMACKERN-LAB.EFI`, that adds `x86/report_x86.c`, `../net/aienos_net.c` and
+tg3 transmit. The default `IMACKERN.EFI`, and any resident or service (ALLEN)
+build, contain none of it; the link step fails a default image that has a
+report symbol. During the hold the lab image sends, every 2 s while the link
+is up, an allowlisted copy of the console (`ck_x86_report_filter`: only
+complete, printable lines of at most 240 bytes whose key is on a fixed list of
+kernel diagnostic keys; everything else, including `memory:`, is dropped
+whole, so chat, keys, tokens and credentials cannot enter it), as UDP
+broadcast from 0.0.0.0 to 255.255.255.255 port 47031 (TTL 1), in 1 KiB parts
+that each start with
+`AIENOS-IMAC-REPORT v=2 auth=none run=<id> part=<i>/<n> bytes=<total>`.
+Anyone on the LAN can read or forge these datagrams; the run id and checksum
+are not authenticity, so a report is never a receipt, evidence or a command.
+Future service diagnostics belong on the authenticated transport with an
+explicitly authorized peer. `tools/ck_imac_report_listen.c` (`make -C
+native/kernel imac-report-listen`, run as `ck_imac_report_listen 47031 OUTDIR
+SECONDS`) says so when it starts, refuses the retired v=1 raw-console format
+and rebuilds each run into `OUTDIR/imac-<run>.unauthenticated.txt`;
+`scripts/ck_imac_report_test.sh` checks the default and lab builds' symbols,
+the allowlist (sentinel lines never leave), the frames and reassembly on the
+host.
+
+Output: the GOP framebuffer
 (`core/fbcon.c`, lines from before ExitBootServices replayed onto it) and COM1
 when a 16550 answers there (QEMU; the iMac has none). Shared, unchanged:
 `core/fbcon.c`, `fmt.c`, `acpi.c`, `handoff_check.c`, `mm/frames.c`, `heap.c`,

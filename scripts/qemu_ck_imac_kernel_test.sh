@@ -118,6 +118,8 @@ run() { # name, -cpu model, expected APIC mode
     chk "${name}: one-line summary" "${txt}" "^summary: cores=4/4 timer=ok sata_disks=2 nvme_disks=1 gpt_valid=2 writes=none net=none\$"
     [[ "$(sha256sum "${nvm}" | cut -d" " -f1)" == "${nvm_sum}" ]] && echo "PASS  ${name}: NVMe disk unchanged" || { echo "FAIL  ${name}: NVMe disk changed"; fails=$((fails + 1)); }
     [[ "$(sha256sum "${data}" | cut -d" " -f1)" == "${data_sum}" ]] && echo "PASS  ${name}: data disk unchanged" || { echo "FAIL  ${name}: data disk changed"; fails=$((fails + 1)); }
+    chk "${name}: W^X probes (#409)" "${txt}" '^wx: ok nx=on wp=on text=rx ro=r data=rw-nx text_write=fault ro_write=fault heap_exec=fault stack_exec=fault$'
+    chk "${name}: W^X audit, only code executable" "${txt}" '^wx_audit: ok wx_leaves=0 exec_pages=([1-9][0-9]*) text_pages=\1 pages_4k=[1-9][0-9]* trampoline=retired$'
     chk "${name}: kernel alive" "${txt}" '^kernel: alive$'
     chk "${name}: DONE" "${txt}" '^AIENOS-IMAC-KERNEL-0 DONE$'
     chk "${name}: ACPI S5 power off" "${txt}" '^power: off via ACPI S5 pm1a=0x[0-9a-f]+ '
@@ -126,10 +128,50 @@ run() { # name, -cpu model, expected APIC mode
     else
         echo "PASS  ${name}: no panic"
     fi
+    # The default image carries no network report (lab-only, CK_X86_REPORT=1).
+    if grep -aqE '^report: ' "${txt}"; then
+        echo "FAIL  ${name}: default image ran the lab-only network report"; fails=$((fails + 1))
+    else
+        echo "PASS  ${name}: no network report in the default image"
+    fi
     [[ ${self_exit} == 1 ]] && echo "PASS  ${name}: QEMU powered off by itself" || { echo "FAIL  ${name}: QEMU still running"; fails=$((fails + 1)); }
     echo "---- ${name} serial ----"; cat "${txt}"; echo "----"
 }
 run max max xapic
 run qemu64 qemu64 xapic
+# Negative controls (#409): builds with W^X deliberately broken must make the kernel's own
+# probes panic. The panic comes before the clock is measured, so the kernel halts instead
+# of powering off: wait for the line, then stop QEMU.
+mut() { # mode, expected panic pattern
+    local m="$1" mo="${work}/mut$1" mi="${work}/mut$1.img" log="${work}/mut$1.log" hit=0
+    make -s -C native/kernel X86_CROSS="${cross}" OUT="${mo}" AIENOS_COMMIT="${commit}" CK_X86_WX_MUTATE="${m}" imac-kernel >/dev/null
+    truncate -s 64M "${mi}"
+    mformat -i "${mi}" -F ::
+    mmd -i "${mi}" ::/EFI ::/EFI/BOOT
+    mcopy -i "${mi}" "${mo}/IMACKERN.EFI" ::/EFI/BOOT/BOOTX64.EFI
+    cp "${vars_fd}" "${work}/vars.fd"
+    qemu-system-x86_64 -M q35 -accel tcg -cpu max -smp 1 -m 1024 \
+        -drive if=pflash,format=raw,readonly=on,file="${code_fd}" \
+        -drive if=pflash,format=raw,file="${work}/vars.fd" \
+        -drive if=none,id=esp,format=raw,file="${mi}" -device ide-hd,drive=esp,bus=ide.0 \
+        -display none -nic none -serial file:"${log}" -no-reboot &
+    qpid=$!
+    for _ in $(seq 1 120); do
+        if tr -d '\r' <"${log}" 2>/dev/null | grep -aqE -- "$2"; then hit=1; break; fi
+        kill -0 "${qpid}" 2>/dev/null || break
+        sleep 1
+    done
+    kill "${qpid}" 2>/dev/null || true
+    wait "${qpid}" 2>/dev/null || true
+    qpid=""
+    if [[ ${hit} == 1 ]] && tr -d '\r' <"${log}" | grep -aq '^wx: MUTATED TEST BUILD'; then
+        echo "PASS  mutation ${m}: broken W^X caught by the kernel's probes"
+    else
+        echo "FAIL  mutation ${m}: no '$2' panic"; fails=$((fails + 1))
+        tr -d '\r' <"${log}" | tail -20
+    fi
+}
+mut 1 '^panic: wx: FAIL .*heap_exec=ALLOWED stack_exec=ALLOWED$'
+mut 2 '^panic: wx: FAIL .*text_write=ALLOWED '
 if [[ ${fails} == 0 ]]; then echo "${tag}: PASS"; exit 0; fi
 echo "${tag}: FAIL (${fails} checks)"; exit 1

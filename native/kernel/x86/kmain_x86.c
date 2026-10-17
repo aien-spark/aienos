@@ -7,14 +7,19 @@
  * allocator over the memory map (mm/frames.c), own 4-level page tables that
  * identity map [0, top) with 2 MiB pages (RAM write-back, the rest uncached,
  * the GOP framebuffer write-combining through PAT entry 1) and a 4 KiB guard
- * page under the kernel stack, CR3 switched and the stack moved. Then: the
+ * page under the kernel stack, CR3 switched and the stack moved. W^X (#409):
+ * EFER.NXE and CR0.WP on every core; only the kernel's code is executable
+ * (read-only), every other leaf is no-execute, read-only data is read-only,
+ * proven by probes and an audit of every leaf. Then: the
  * screen console (core/fbcon.c), heap (mm/heap.c), the guard page proven to
  * fault and the fault contained, the TSC measured against the HPET, the
  * local APIC (xAPIC) with its timer at 100 Hz for 20 ticks, the MADT CPU
  * count, the secondary cores started and parked (smp_x86.S), the AHCI and
  * NVMe disks read-only and a look at the Ethernet chip (pci_x86.c,
  * ahci_x86.c), and the final report. It holds the screen CK_X86_HOLD_S seconds and
- * powers off through ACPI S5 (FADT PM1 control + the DSDT's \_S5 package).
+ * powers off through ACPI S5 (FADT PM1 control + the DSDT's \_S5 package); the lab image
+ * (CK_X86_REPORT=1) restarts through the FADT reset register instead, back
+ * into its network loader (native/boot/net_loader.c).
  * Scheduling on the secondary cores, disk writes, the network driver and VT-d
  * are later cuts. No runtime service
  * is called. QEMU runs of this path qualify nothing physical. */
@@ -26,6 +31,9 @@
 
 #ifndef AIENOS_COMMIT
 #define AIENOS_COMMIT "unknown"
+#endif
+#ifndef CK_X86_REPORT
+#define CK_X86_REPORT 0 /* 1 only in the opt-in lab image: the network report */
 #endif
 #ifndef CK_X86_HOLD_S
 #define CK_X86_HOLD_S 60u
@@ -46,7 +54,20 @@
 #define PTE_PWT 0x8ull
 #define PTE_PCD 0x10ull
 #define PTE_PS 0x80ull
+#define PTE_NX (1ull << 63)
 #define PTE_ADDR 0x000ffffffffff000ull
+#define MSR_EFER 0xc0000080u
+#define EFER_NXE (1ull << 11)
+#define CR0_WP (1ull << 16)
+
+/* CK_X86_WX_MUTATE (negative test builds only): 1 leaves RAM executable,
+ * 2 leaves the kernel's code writable. The W^X probes must then FAIL. */
+#ifndef CK_X86_WX_MUTATE
+#define CK_X86_WX_MUTATE 0
+#endif
+
+/* Image regions (image_x86_64.ld), runtime addresses after self-relocation. */
+extern char __image_base[], __text_start[], __text_end[], __ro_start[], __ro_end[], __image_end[];
 
 const char *ck_commit(void) { return AIENOS_COMMIT; }
 
@@ -203,18 +224,60 @@ static void acpi_poweroff(void)
     ck_puts("power: still running after the S5 write\n");
 }
 
+#if CK_X86_REPORT
+/* Lab image only: restart instead of powering off, so the iMac comes back to
+ * its network loader (NETLDR.EFI) for the next test without a hand on the
+ * power button. The FADT reset register (ACPI 6.5 section 4.8.3.6; on the
+ * iMac18,3: flags bit 10 RESET_REG_SUP set, SystemIO port 0xCF9, value 0x06,
+ * read from its FACP table on 2026-10-17); without one, the same write to the
+ * PCH reset control port 0xCF9 that the FADT names. */
+static void acpi_reset(void)
+{
+    const uint8_t *fadt = hand && hand->rsdp ? ck_acpi_lookup(hand->rsdp, "FACP") : 0;
+    uint16_t port = 0xCF9;
+    uint8_t value = 0x06;
+    if (fadt && rd32(fadt, 4) >= 129 && (rd32(fadt, 112) & (1u << 10)) && fadt[116] == 1 /* SystemIO */ &&
+        rd64(fadt, 120) && rd64(fadt, 120) <= 0xffff) {
+        port = (uint16_t)rd64(fadt, 120);
+        value = fadt[128];
+        ck_printf("power: restart via the ACPI reset register port=0x%x value=0x%x\n", port, value);
+    } else {
+        ck_puts("power: restart via port 0xcf9 (no usable ACPI reset register)\n");
+    }
+    ck_outb(port, value);
+    for (volatile uint64_t i = 0; i < 100000000ull; i++)
+        __asm__ volatile("pause");
+    ck_puts("power: still running after the reset write\n");
+}
+#endif
+
 static __attribute__((noreturn)) void finish(void)
 {
     ck_cli();
     if (!tsc_hz) { /* no clock yet: keep the screen readable, never power off unseen */
+#if CK_X86_REPORT
+        ck_puts("power: no clock measured; lab image restarts\n");
+        acpi_reset();
+#endif
         ck_puts("power: halted before the clock was measured; hold the power button to turn the machine off\n");
         for (;;)
             __asm__ volatile("hlt");
     }
     if (CK_X86_HOLD_S) {
+#if CK_X86_REPORT
+        /* Lab build only (make imac-kernel CK_X86_REPORT=1): sends the
+         * allowlisted, unauthenticated report if the network is up. */
+        ck_printf("power: holding the screen %u s, then restart\n", (unsigned)CK_X86_HOLD_S);
+        ck_x86_report_hold(tsc_hz, CK_X86_HOLD_S);
+#else
+        /* Default and resident builds: no report code is linked; nothing is sent. */
         ck_printf("power: holding the screen %u s, then ACPI S5\n", (unsigned)CK_X86_HOLD_S);
-        ck_x86_report_hold(tsc_hz, CK_X86_HOLD_S); /* sends the report if the network is up */
+        delay_ms((uint64_t)CK_X86_HOLD_S * 1000u);
+#endif
     }
+#if CK_X86_REPORT
+    acpi_reset();
+#endif
     acpi_poweroff();
     ck_puts("power: halted; hold the power button to turn the machine off\n");
     for (;;)
@@ -301,7 +364,7 @@ void ck_x86_trap(struct ck_x86_frame *f)
 
 /* ---- memory ---- */
 struct mm {
-    uint64_t root, top, pages_wb, pages_wc, pages_uc, pt_frames, fb_lo, fb_hi;
+    uint64_t root, top, pages_wb, pages_wc, pages_uc, pt_frames, fb_lo, fb_hi, pages_4k;
     int fb_ok;
 };
 static struct mm mm;
@@ -321,6 +384,88 @@ static uint64_t *table_new(void)
 static int efi_ram(uint32_t type)
 {
     return type <= 10 && type != 0 && type != 8;
+}
+
+static uint64_t *pds[MAP_TOP_MAX >> 30];
+
+static int in(uint64_t p, const char *lo, const char *hi)
+{
+    return p >= (uint64_t)(uintptr_t)lo && p < (uint64_t)(uintptr_t)hi;
+}
+
+/* The permission of one 4 KiB page inside a split 2 MiB page: the stack
+ * guard unmapped, code read-only executable, the PE header and read-only data
+ * read-only no-execute, the trampoline writable executable until
+ * wx_retire_trampoline(), everything else writable no-execute. */
+static uint64_t leaf4k(uint64_t p, uint64_t cache, uint64_t nx)
+{
+    if (p == (uint64_t)(uintptr_t)kstack)
+        return 0;
+    if (in(p, __text_start, __text_end))
+        return p | PTE_P | cache | (CK_X86_WX_MUTATE == 2 ? PTE_W : 0);
+    if (in(p, __image_base, __text_start) || in(p, __ro_start, __ro_end))
+        return p | PTE_P | cache | nx;
+    if (tramp_pa && p == tramp_pa)
+        return p | PTE_P | PTE_W | cache;
+    return p | PTE_P | PTE_W | cache | nx;
+}
+
+static void split_2m(uint64_t a, uint64_t nx)
+{
+    uint64_t *e = &pds[a >> 30][(a >> 21) & 511];
+    if (!(*e & PTE_PS))
+        return; /* already split */
+    uint64_t cache = *e & (PTE_PCD | PTE_PWT), *pt = table_new();
+    for (uint64_t j = 0; j < 512; j++)
+        pt[j] = leaf4k(a | j << 12, cache, nx);
+    *e = (uint64_t)(uintptr_t)pt | PTE_P | PTE_W;
+    mm.pages_4k += 512;
+}
+
+/* The 4 KiB PTE mapping `a`, or 0 when `a` sits in a 2 MiB page. */
+static uint64_t *pte4k(uint64_t a)
+{
+    uint64_t e = pds[a >> 30][(a >> 21) & 511];
+    if (!(e & PTE_P) || (e & PTE_PS))
+        return 0;
+    return (uint64_t *)(uintptr_t)(e & PTE_ADDR) + ((a >> 12) & 511);
+}
+
+/* The secondary cores are up (or will never start): the trampoline page
+ * becomes read-only no-execute data. */
+static void wx_retire_trampoline(void)
+{
+    uint64_t *e = tramp_pa ? pte4k(tramp_pa) : 0;
+    if (!e)
+        return;
+    *e = (*e & ~PTE_W) | (CK_X86_WX_MUTATE == 1 ? 0 : PTE_NX);
+    __asm__ volatile("invlpg (%0)" ::"r"(tramp_pa) : "memory");
+}
+
+/* Every present leaf of the identity map: writable+executable ones, and
+ * executable 4 KiB units (must equal the code pages). */
+static void wx_audit(uint64_t *wx, uint64_t *exec4k)
+{
+    *wx = *exec4k = 0;
+    for (uint64_t g = 0; g < mm.top >> 30; g++)
+        for (uint64_t i = 0; i < 512; i++) {
+            uint64_t e = pds[g][i];
+            if (!(e & PTE_P))
+                continue;
+            if (e & PTE_PS) {
+                if (!(e & PTE_NX)) {
+                    *exec4k += 512;
+                    *wx += !!(e & PTE_W);
+                }
+                continue;
+            }
+            const uint64_t *pt = (const uint64_t *)(uintptr_t)(e & PTE_ADDR);
+            for (uint64_t j = 0; j < 512; j++)
+                if ((pt[j] & PTE_P) && !(pt[j] & PTE_NX)) {
+                    (*exec4k)++;
+                    *wx += !!(pt[j] & PTE_W);
+                }
+        }
 }
 
 static void mm_build(void)
@@ -364,30 +509,29 @@ static void mm_build(void)
     /* Every 2 MiB page starts uncached (PCD|PWT, PAT index 3): device memory
      * (local APIC, I/O APIC, HPET, PCI BARs) whatever the MTRRs say. Pages
      * that hold RAM from the memory map become write-back (index 0), the
-     * framebuffer write-combining (PWT alone, index 1, set to WC below). The
-     * 2 MiB page holding the stack guard is split into 4 KiB pages. */
-    static uint64_t *pds[MAP_TOP_MAX >> 30];
+     * framebuffer write-combining (PWT alone, index 1, set to WC below).
+     * W^X (#409): every leaf is no-execute except the kernel's code (and the
+     * secondary-core trampoline while the cores start); the 2 MiB pages that
+     * hold the image or the trampoline are split into 4 KiB pages below.
+     * W^X separates code from data inside one privilege level; it is not
+     * process isolation. Learned or generated code must never run here. */
     if (ck_rd_cr4() & (1ull << 12))
         ck_panic("paging: firmware runs 5-level paging (CR4.LA57); this kernel builds 4-level tables");
+    uint32_t xr[4];
+    ck_cpuid(0x80000000, 0, xr);
+    if (xr[0] < 0x80000001)
+        ck_panic("paging: CPU has no extended CPUID leaf for NX");
+    ck_cpuid(0x80000001, 0, xr);
+    if (!(xr[3] & (1u << 20)))
+        ck_panic("paging: CPU has no NX (execute disable)");
+    uint64_t nx = CK_X86_WX_MUTATE == 1 ? 0 : PTE_NX;
     uint64_t *pml4 = table_new(), *pdpt = table_new();
     pml4[0] = (uint64_t)(uintptr_t)pdpt | PTE_P | PTE_W;
-    uint64_t guard = (uint64_t)(uintptr_t)kstack;
     for (uint64_t g = 0; g < top >> 30; g++) {
         uint64_t *pd = pds[g] = table_new();
         pdpt[g] = (uint64_t)(uintptr_t)pd | PTE_P | PTE_W;
-        for (uint64_t i = 0; i < 512; i++) {
-            uint64_t a = g << 30 | i << 21;
-            if (a <= guard && guard < a + (2ull << 20)) {
-                uint64_t *pt = table_new();
-                for (uint64_t j = 0; j < 512; j++) {
-                    uint64_t p = a | j << 12;
-                    pt[j] = p == guard ? 0 : (p | PTE_P | PTE_W);
-                }
-                pd[i] = (uint64_t)(uintptr_t)pt | PTE_P | PTE_W;
-                continue;
-            }
-            pd[i] = a | PTE_P | PTE_W | PTE_PS | PTE_PCD | PTE_PWT;
-        }
+        for (uint64_t i = 0; i < 512; i++)
+            pd[i] = (g << 30 | i << 21) | PTE_P | PTE_W | PTE_PS | PTE_PCD | PTE_PWT | nx;
     }
     for (uint64_t off = 0; off + h->desc_size <= h->map_size; off += h->desc_size) {
         const struct ck_efi_desc *d = (const void *)(uintptr_t)(h->memory_map + off);
@@ -405,6 +549,13 @@ static void mm_build(void)
         if (*e & PTE_PS)
             *e = (*e & ~PTE_PCD) | PTE_PWT;
     }
+    /* 4 KiB pages where the image and the trampoline live, keeping the
+     * 2 MiB page's cache type (PCD/PWT sit at the same bits in a 4 KiB PTE). */
+    uint64_t img_lo = (uint64_t)(uintptr_t)__image_base, img_hi = (uint64_t)(uintptr_t)__image_end;
+    for (uint64_t a = img_lo & ~((2ull << 20) - 1); a < img_hi; a += 2ull << 20)
+        split_2m(a, nx);
+    if (tramp_pa)
+        split_2m(tramp_pa & ~((2ull << 20) - 1), nx);
     for (uint64_t g = 0; g < top >> 30; g++)
         for (uint64_t i = 0; i < 512; i++) {
             uint64_t e = pds[g][i];
@@ -426,7 +577,12 @@ static void mm_build(void)
         ck_panic("paging: CPU has no PAT");
     __asm__ volatile("wbinvd" ::: "memory");
     ck_wrmsr(0x277, 0x0007040600070106ull);
+    /* NX bits are reserved (a #PF on every access) until EFER.NXE is set. */
+    ck_wrmsr(MSR_EFER, ck_rdmsr(MSR_EFER) | EFER_NXE);
     ck_wr_cr3(mm.root);
+    uint64_t cr0;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    __asm__ volatile("mov %0, %%cr0" ::"r"(cr0 | CR0_WP) : "memory"); /* read-only binds the kernel too */
     /* Toggling CR4.PGE drops global TLB entries the firmware's tables left. */
     uint64_t cr4 = ck_rd_cr4();
     if (cr4 & 0x80) {
@@ -457,7 +613,7 @@ int ck_x86_map_mmio(uint64_t pa, uint64_t len)
         uint64_t *pd = sub_table(sub_table(pml4, (unsigned)(a >> 39) & 511), (unsigned)(a >> 30) & 511);
         uint64_t *e = &pd[(a >> 21) & 511];
         if (!(*e & PTE_P)) {
-            *e = a | PTE_P | PTE_W | PTE_PS | PTE_PCD | PTE_PWT;
+            *e = a | PTE_P | PTE_W | PTE_PS | PTE_PCD | PTE_PWT | PTE_NX;
             mm.pages_uc++;
         }
         __asm__ volatile("invlpg (%0)" ::"r"(a) : "memory");
@@ -729,6 +885,68 @@ static void smp_start(const struct apic_report *ar, struct smp_report *sr)
     }
 }
 
+/* ---- W^X probes (#409) ----
+ * Each probe arms the #PF catcher (ck_x86_trap), touches one address and
+ * resumes at the label after the access. A store writes back the byte it
+ * read, so a mutated (writable) build changes nothing. An execute probe
+ * jumps to two bytes `jmp *%rax` with rax = the resume label, so code that
+ * does run comes straight back and the probe sees no fault. */
+static int probe_store(uint64_t a)
+{
+    probe.hit = 0;
+    probe.armed = 1;
+    __asm__ volatile("lea 1f(%%rip), %%rax\n\t"
+                     "mov %%rax, %0\n\t"
+                     "movb (%1), %%cl\n\t"
+                     "movb %%cl, (%1)\n"
+                     "1:"
+                     : "=m"(probe.resume)
+                     : "r"(a)
+                     : "rax", "rcx", "memory");
+    probe.armed = 0;
+    return probe.hit && probe.cr2 == a && (probe.err & 3) == 3; /* present + write */
+}
+
+static int probe_exec(uint8_t *buf)
+{
+    buf[0] = 0xff; /* jmp *%rax */
+    buf[1] = 0xe0;
+    uint64_t a = (uint64_t)(uintptr_t)buf;
+    probe.hit = 0;
+    probe.armed = 1;
+    __asm__ volatile("lea 1f(%%rip), %%rax\n\t"
+                     "mov %%rax, %0\n\t"
+                     "jmp *%1\n"
+                     "1:"
+                     : "=m"(probe.resume)
+                     : "r"(a)
+                     : "rax", "memory");
+    probe.armed = 0;
+    return probe.hit && probe.cr2 == a && (probe.err & 0x11) == 0x11; /* present + instruction fetch */
+}
+
+static void wx_probes(void)
+{
+    uint64_t efer = ck_rdmsr(MSR_EFER), cr0;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    uint8_t *hb = ck_heap_alloc(&heap, 16);
+    volatile uint8_t sb[16];
+    if (!hb)
+        ck_panic("wx: no heap for the execute probe");
+    int tw = probe_store((uint64_t)(uintptr_t)__text_start);
+    int rw = probe_store((uint64_t)(uintptr_t)__ro_start);
+    int hx = probe_exec(hb);
+    int sx = probe_exec((uint8_t *)sb);
+    ck_heap_free(&heap, hb);
+    const char *f = "fault", *n = "ALLOWED";
+    if (!(efer & EFER_NXE) || !(cr0 & CR0_WP) || !tw || !rw || !hx || !sx)
+        ck_panic("wx: FAIL nx=%s wp=%s text_write=%s ro_write=%s heap_exec=%s stack_exec=%s",
+                 efer & EFER_NXE ? "on" : "off", cr0 & CR0_WP ? "on" : "off", tw ? f : n, rw ? f : n,
+                 hx ? f : n, sx ? f : n);
+    ck_puts("wx: ok nx=on wp=on text=rx ro=r data=rw-nx text_write=fault ro_write=fault heap_exec=fault "
+            "stack_exec=fault\n");
+}
+
 /* ---- the kernel ---- */
 static void cpu_line(void)
 {
@@ -814,6 +1032,8 @@ static __attribute__((noreturn)) void kernel_main(void *arg)
         ck_panic("guard_page: FAIL hit=%d cr2=0x%llx error=0x%llx", probe.hit, (unsigned long long)probe.cr2,
                  (unsigned long long)probe.err);
 
+    wx_probes();
+
     tsc_measure();
     if (!tsc_hz)
         ck_panic("timebase: no HPET and no CPUID leaf 0x16 frequency");
@@ -835,6 +1055,14 @@ static __attribute__((noreturn)) void kernel_main(void *arg)
 
     struct smp_report sr = {0};
     smp_start(&ar, &sr);
+    wx_retire_trampoline();
+    uint64_t wx, exec4k, text4k = (uint64_t)(__text_end - __text_start) >> 12;
+    wx_audit(&wx, &exec4k);
+    if (wx || exec4k != text4k)
+        ck_panic("wx_audit: FAIL wx_leaves=%llu exec_pages=%llu text_pages=%llu", (unsigned long long)wx,
+                 (unsigned long long)exec4k, (unsigned long long)text4k);
+    ck_printf("wx_audit: ok wx_leaves=0 exec_pages=%llu text_pages=%llu pages_4k=%llu trampoline=retired\n",
+              (unsigned long long)exec4k, (unsigned long long)text4k, (unsigned long long)mm.pages_4k);
     if (sr.why) {
         ck_printf("smp: cpus=%u started=0 (%s)\n", sr.listed, sr.why);
     } else {
@@ -868,6 +1096,9 @@ void ck_x86_kernel_entry(struct ck_handoff *h)
     hand = h;
     tables_load();
     ck_puts("\nreport_kind: kernel\n");
+    if (CK_X86_WX_MUTATE)
+        ck_printf("wx: MUTATED TEST BUILD (CK_X86_WX_MUTATE=%u): W^X deliberately broken, never deploy\n",
+                  (unsigned)CK_X86_WX_MUTATE);
     ck_printf("exit_boot_services: ok attempts=%u\n", h->exit_attempts);
     cpu_line();
     ck_puts("descriptors: gdt=5 tss=yes ist1=df,nmi,mc idt=256\n");
